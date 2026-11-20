@@ -174,6 +174,34 @@ function parseAIReport(completion) {
   try { const m = text.match(/\{[\s\S]*\}/); return m ? JSON.parse(m[0]) : null; } catch { return null; }
 }
 
+// The app saves every practice test to topic_attempts, but this report used
+// to count only legacy 'ibpyp_quiz_result' / 'ncert_quiz_result' analytics
+// events, so newer quiz scores were missing. Each real attempt now becomes a
+// quiz-result signal. Legacy events stay (valid historical records) unless
+// they describe the same test as an attempt (same topic, subject and score
+// within 15 minutes), so nothing is counted twice.
+const SAME_TEST_WINDOW_MS = 15 * 60 * 1000;
+function mergeQuizEvidence(events, attempts) {
+  const fromAttempts = (attempts || [])
+    .filter(a => a && a.topic && a.score != null && Number.isFinite(Number(a.score))
+      && ((a.total_questions || 0) > 0 || (Array.isArray(a.per_question_results) && a.per_question_results.length > 0)))
+    .map(a => ({
+      eventType: 'practice_test_result',
+      timestamp: a.created_at,
+      topic:     a.topic,
+      subject:   a.subject || '',
+      score:     Math.round(Number(a.score)),
+    }));
+  const key = (e) => `${String(e.topic).trim().toLowerCase()}|${String(e.subject).trim().toLowerCase()}|${Math.round(Number(e.score))}`;
+  const isQuiz = (e) => e.eventType === 'ibpyp_quiz_result' || e.eventType === 'ncert_quiz_result';
+  const kept = (events || []).filter(e => {
+    if (!isQuiz(e)) return true;
+    const t = new Date(e.timestamp).getTime();
+    return !fromAttempts.some(a => key(a) === key(e) && Math.abs(new Date(a.timestamp).getTime() - t) <= SAME_TEST_WINDOW_MS);
+  });
+  return [...kept, ...fromAttempts];
+}
+
 // ── GET /parent/:parentEmail/children/:childId/ai-report ──────────────────
 // Two-stage pipeline: deterministic signals (this service) → AI mentor
 // reasoning (Groq). Ported from the monolith's ai-mentor/server/routes/parent.js
@@ -200,7 +228,7 @@ router.get('/:parentEmail/children/:childId/ai-report', async (req, res) => {
       .maybeSingle();
     if (!student) return res.status(404).json({ error: 'Student not found.' });
 
-    const [statsRes, dailyLogsRes, submissionsRes, challengesRes, eventsRes] = await Promise.all([
+    const [statsRes, dailyLogsRes, submissionsRes, challengesRes, eventsRes, attemptsRes] = await Promise.all([
       supabase.from('student_stats').select('*').eq('student_id', childId).maybeSingle(),
       supabase.from('student_daily_log')
         .select('log_date, study_minutes, xp_earned, topics_completed')
@@ -222,19 +250,29 @@ router.get('/:parentEmail/children/:childId/ai-report', async (req, res) => {
         .eq('user_email', String(student.email || '').toLowerCase())
         .order('timestamp', { ascending: false })
         .limit(500),
+      // Practice tests are saved here (leaderboard-service POST
+      // /student/track-attempt) — the real quiz record the app writes today.
+      supabase.from('topic_attempts')
+        .select('topic, subject, score, total_questions, per_question_results, created_at')
+        .eq('student_id', childId)
+        .order('created_at', { ascending: false })
+        .limit(500),
     ]);
 
     const stats       = statsRes.data;
     const dailyLogs   = dailyLogsRes.data   || [];
     const submissions = submissionsRes.data || [];
     const challenges  = challengesRes.data  || [];
-    const analyticsEvents = (eventsRes.data || []).map(e => ({
-      eventType: e.event_type,
-      timestamp: e.timestamp,
-      topic:     e.topic   || '',
-      subject:   e.subject || '',
-      score:     e.score,
-    }));
+    const analyticsEvents = mergeQuizEvidence(
+      (eventsRes.data || []).map(e => ({
+        eventType: e.event_type,
+        timestamp: e.timestamp,
+        topic:     e.topic   || '',
+        subject:   e.subject || '',
+        score:     e.score,
+      })),
+      attemptsRes?.data || [],
+    );
 
     const xp                  = stats?.xp_points          ?? 0;
     const streak               = stats?.current_streak     ?? 0;
@@ -268,7 +306,7 @@ router.get('/:parentEmail/children/:childId/ai-report', async (req, res) => {
       const subj = subjectMap[e.subject];
       if (!subj.topics[e.topic]) subj.topics[e.topic] = { scores: [], sessions: 0 };
       const t = subj.topics[e.topic];
-      if ((e.eventType === 'ibpyp_quiz_result' || e.eventType === 'ncert_quiz_result') && typeof e.score === 'number') {
+      if ((e.eventType === 'ibpyp_quiz_result' || e.eventType === 'ncert_quiz_result' || e.eventType === 'practice_test_result') && typeof e.score === 'number') {
         subj.scores.push(e.score); t.scores.push(e.score);
       }
       if (e.eventType === 'lesson_started' || e.eventType === 'ai_lesson_script') t.sessions++;
@@ -938,3 +976,4 @@ router.delete('/:parentEmail/children/:childId', async (req, res) => {
 });
 
 module.exports = router;
+module.exports.mergeQuizEvidence = mergeQuizEvidence;
