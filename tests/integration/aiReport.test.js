@@ -228,3 +228,41 @@ describe('GET /parent/:parentEmail/children/:childId/ai-report', () => {
     });
   });
 });
+
+describe('AI report reads practice tests from topic_attempts', () => {
+  const { mergeQuizEvidence } = require('../../routes/parent');
+
+  test('attempts become quiz results; a legacy event for the same test is not double-counted; older events stay', () => {
+    const merged = mergeQuizEvidence(
+      [
+        { eventType: 'ibpyp_quiz_result', timestamp: '2026-11-18T10:05:00Z', topic: 'A Concrete Example', subject: 'English', score: 80 },
+        { eventType: 'ncert_quiz_result', timestamp: '2026-08-01T10:00:00Z', topic: 'Kite', subject: 'English', score: 60 },
+        { eventType: 'lesson_started', timestamp: '2026-11-18T09:00:00Z', topic: 'A Concrete Example', subject: 'English' },
+      ],
+      [
+        { topic: 'A Concrete Example', subject: 'English', score: '80.00', total_questions: 6, created_at: '2026-11-18T10:00:00Z' },
+        { topic: 'Old completeLesson row', subject: 'English', score: 100, total_questions: 0, per_question_results: [], created_at: '2026-07-01' },
+      ],
+    );
+    const quiz = merged.filter((e) => /result/.test(e.eventType));
+    expect(quiz.map((e) => [e.topic, e.score])).toEqual([['Kite', 60], ['A Concrete Example', 80]]);
+    expect(merged.some((e) => e.eventType === 'lesson_started')).toBe(true);
+  });
+
+  test('a child whose only activity is a practice test gets a report with that topic score', async () => {
+    mockSb.setTable('parent_children', { data: { child_id: 'child-1' }, error: null });
+    mockSb.setTable('users', { data: { name: 'Anaya', email: 'anaya@example.com', grade: 'Grade 8', curriculum: 'CBSE', school: '' }, error: null });
+    mockSb.setTable('student_stats', { data: null, error: null });
+    mockSb.setTable('student_daily_log', { data: [], error: null });
+    mockSb.setTable('assignment_submissions', { data: [], error: null });
+    mockSb.setTable('challenge_assignments', { data: [], error: null });
+    mockSb.setTable('analytics_events', { data: [], error: null });
+    mockSb.setTable('topic_attempts', { data: [{ topic: 'A Concrete Example', subject: 'English', score: 80, total_questions: 6, created_at: '2026-11-18T10:00:00Z' }], error: null });
+
+    const res = await request(app).get('/parent/parent@example.com/children/child-1/ai-report');
+
+    expect(res.status).toBe(200);
+    expect(res.body.noData).toBeUndefined();
+    expect(res.body.subjectPerformance).toEqual([expect.objectContaining({ subject: 'English', avgScore: 80, quizCount: 1 })]);
+  });
+});
